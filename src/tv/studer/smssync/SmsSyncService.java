@@ -25,6 +25,8 @@ import android.content.Context;
 import android.content.Intent;
 import android.database.Cursor;
 import android.net.Uri;
+import android.net.wifi.WifiManager;
+import android.net.wifi.WifiManager.WifiLock;
 import android.os.IBinder;
 import android.os.PowerManager;
 import android.os.Process;
@@ -44,6 +46,8 @@ public class SmsSyncService extends Service {
     private static final int MAX_MSG_PER_REQUEST = 1;
     
     /** Flag indicating whether this service is already running. */
+    // Should this be split into sIsRunning and sIsWorking? One for the
+    // service, the other for the actual backing up?
     private static boolean sIsRunning = false;
 
     // State information
@@ -74,10 +78,24 @@ public class SmsSyncService extends Service {
      */
     private static StateChangeListener sStateChangeListener;
 
+    /**
+     * A wakelock held while this service is working.
+     */
     private static WakeLock sWakeLock;
     
+    /**
+     * A wifilock held while this service is working.
+     */
+    private static WifiLock sWifiLock;
+    
+    /**
+     * Indicates that the user canceled the current backup and that this service
+     * should finish working ASAP.
+     */
+    private static boolean sCanceled;
+    
     public enum SmsSyncState {
-        IDLE, CALC, LOGIN, SYNC, AUTH_FAILED, GENERAL_ERROR;
+        IDLE, CALC, LOGIN, SYNC, AUTH_FAILED, GENERAL_ERROR, CANCELED;
     }
 
     @Override
@@ -90,15 +108,22 @@ public class SmsSyncService extends Service {
             PowerManager pMgr = (PowerManager) ctx.getSystemService(POWER_SERVICE);
             sWakeLock = pMgr.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,
                     "SmsSyncService.sync() wakelock.");
+            
+            WifiManager wMgr = (WifiManager) ctx.getSystemService(WIFI_SERVICE);
+            sWifiLock = wMgr.createWifiLock("SMS Backup");
         }
         sWakeLock.acquire();
+        sWifiLock.acquire();
     }
     
     private static void releaseWakeLock(Context ctx) {
         sWakeLock.release();
+        sWifiLock.release();
     }
     
     @Override
+    //TODO(chstuder): Clean this flow up a bit and split it into multiple
+    // methods. Make clean distinction between onStart(...) and backup(...).
     public void onStart(final Intent intent, int startId) {
         super.onStart(intent, startId);
         
@@ -114,8 +139,7 @@ public class SmsSyncService extends Service {
                         Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
                         try {
                             // On first sync we need to know whether to skip or
-                            // sync current
-                            // messages.
+                            // sync current messages.
                             if (PrefStore.isFirstSync(SmsSyncService.this)
                                     && !intent.hasExtra(Consts.KEY_SKIP_MESSAGES)) {
                                 throw new GeneralErrorException(SmsSyncService.this,
@@ -129,7 +153,7 @@ public class SmsSyncService extends Service {
                             // Try sync numRetries + 1 times.
                             while (numRetries >= 0) {
                                 try {
-                                    sync(skipMessages);
+                                    backup(skipMessages);
                                     break;
                                 } catch (GeneralErrorException e) {
                                     Log.w(Consts.TAG, e.getMessage());
@@ -190,6 +214,8 @@ public class SmsSyncService extends Service {
      * {@link #MAX_MSG_PER_REQUEST} per request. After each successful sync
      * request, the maximum ID of synced messages is updated such that future
      * syncs will skip.</li>
+     * <li>{@link SmsSyncState#CANCELED}: If {@link #cancel()} was called during
+     * backup, the backup will stop at the next possible occasion.</li>
      * </ol>
      * 
      * <h2>Preconditions</h2>
@@ -202,7 +228,7 @@ public class SmsSyncService extends Service {
      * <p>
      * <code>skipMessages</code>: If this parameter is <code>true</code>, all
      * current messages stored on the device are skipped and marked as "synced".
-     * Future syncs will ignore these messages and only messages arrived
+     * Future backups will ignore these messages and only messages arrived
      * afterwards will be sent to the server.
      * </p>
      * 
@@ -210,9 +236,10 @@ public class SmsSyncService extends Service {
      * @throws GeneralErrorException Thrown when there there was an error during
      *             sync.
      */
-    private void sync(boolean skipMessages) throws GeneralErrorException,
+    private void backup(boolean skipMessages) throws GeneralErrorException,
             AuthenticationErrorException {
-        Log.i(Consts.TAG, "Starting sync...");
+        Log.i(Consts.TAG, "Starting backup...");
+        sCanceled = false;
 
         if (!PrefStore.isLoginInformationSet(this)) {
             throw new GeneralErrorException(this, R.string.err_sync_requires_login_info, null);
@@ -240,9 +267,14 @@ public class SmsSyncService extends Service {
         Cursor items = getItemsToSync();
         int maxItemsPerSync = PrefStore.getMaxItemsPerSync(this);
         sItemsToSync = Math.min(items.getCount(), maxItemsPerSync);
-        Log.d(Consts.TAG, "Total messages to sync: " + sItemsToSync);
+        Log.d(Consts.TAG, "Total messages to backup: " + sItemsToSync);
         if (sItemsToSync == 0) {
             PrefStore.setLastSync(this);
+            if (PrefStore.isFirstSync(this)) {
+                // If this is the first backup we need to write something to PREF_MAX_SYNCED_DATE
+                // such that we know that we've performed a backup before.
+                PrefStore.setMaxSyncedDate(this, PrefStore.DEFAULT_MAX_SYNCED_DATE);
+            }
             updateState(SmsSyncState.IDLE);
             Log.d(Consts.TAG, "Nothing to do.");
             return;
@@ -256,7 +288,7 @@ public class SmsSyncService extends Service {
         String label = PrefStore.getImapFolder(this);
         try {
             imapStore = new ImapStore(String.format(Consts.IMAP_URI, URLEncoder.encode(username),
-                    URLEncoder.encode(password)));
+                    URLEncoder.encode(password).replace("+", "%20")));
             folder = imapStore.getFolder(label);
             folderExists = folder.exists();
             if (!folderExists) {
@@ -269,9 +301,15 @@ public class SmsSyncService extends Service {
         }
         
         CursorToMessage converter = new CursorToMessage(this, username);
-        while (true) {
-            updateState(SmsSyncState.SYNC);
-            try {
+        try {
+            while (true) {
+                // Cancel sync if requested by the user.
+                if (sCanceled) {
+                    Log.i(Consts.TAG, "Backup canceled by user.");
+                    updateState(SmsSyncState.CANCELED);
+                    break;
+                }
+                updateState(SmsSyncState.SYNC);
                 ConversionResult result = converter.cursorToMessageArray(items,
                         MAX_MSG_PER_REQUEST);
                 List<Message> messages = result.messageList;
@@ -293,19 +331,18 @@ public class SmsSyncService extends Service {
                 updateMaxSyncedDate(result.maxDate);
                 result = null;
                 messages = null;
-            } catch (MessagingException e) {
-                throw new GeneralErrorException(this, R.string.err_communication_error, e);
-            } finally {
-                // Close the cursor
-                items.close();
             }
+        } catch (MessagingException e) {
+            throw new GeneralErrorException(this, R.string.err_communication_error, e);
+        } finally {
+            items.close();
         }
     }
 
     /**
      * Returns a cursor of SMS messages that have not yet been synced with the
      * server. This includes all messages with
-     * <code>ID &lt; {@link #getMaxSyncedDate()}</code> which are no drafs.
+     * <code>date &lt; {@link #getMaxSyncedDate()}</code> which are no drafs.
      */
     private Cursor getItemsToSync() {
         ContentResolver r = getContentResolver();
@@ -314,7 +351,7 @@ public class SmsSyncService extends Service {
         String[] selectionArgs = new String[] {
                 String.valueOf(getMaxSyncedDate()), String.valueOf(SmsConsts.MESSAGE_TYPE_DRAFT)
         };
-        String sortOrder = SmsConsts.DATE;
+        String sortOrder = SmsConsts.DATE + " LIMIT " + PrefStore.getMaxItemsPerSync(this);
         return r.query(Uri.parse("content://sms"), null, selection, selectionArgs, sortOrder);
     }
 
@@ -331,11 +368,20 @@ public class SmsSyncService extends Service {
             SmsConsts.DATE
         };
         Cursor result = r.query(Uri.parse("content://sms"), projection, selection, selectionArgs,
-                SmsConsts.DATE + " DESC");
-        if (result.moveToFirst()) {
-            return result.getLong(0);
-        } else {
-            return PrefStore.DEFAULT_MAX_SYNCED_DATE;
+                SmsConsts.DATE + " DESC LIMIT 1");
+
+        try
+        {
+            if (result.moveToFirst()) {
+                return result.getLong(0);
+            } else {
+                return PrefStore.DEFAULT_MAX_SYNCED_DATE;
+            }
+        }
+        catch (RuntimeException e)
+        {
+            result.close();
+            throw e;
         }
     }
 
@@ -359,8 +405,32 @@ public class SmsSyncService extends Service {
         Log.d(Consts.TAG, "Max synced date set to: " + maxSyncedDate);
     }
 
+    // Actions available from other classes.
+    
+    /**
+     * Cancels the current ongoing backup.
+     * 
+     * TODO(chstuder): Clean up this interface a bit. It's strange the backup is
+     * started by an intent but canceling is done through a static method.
+     * 
+     * But all other alternatives seem strange too. An intent just to cancel a backup?
+     */
+    static void cancel() {
+        if (SmsSyncService.sIsRunning) {
+            SmsSyncService.sCanceled = true;
+        }
+    }
+    
     // Statistics accessible from other classes.
 
+    /**
+     * Returns whether there is currently a backup going on or not.
+     * 
+     */
+    static boolean isWorking() {
+        return sIsRunning;
+    }
+    
     /**
      * Returns the current state of the service. Also see
      * {@link #setStateChangeListener(StateChangeListener)} to get notified when

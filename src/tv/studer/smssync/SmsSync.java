@@ -32,6 +32,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.preference.Preference;
 import android.preference.PreferenceActivity;
@@ -80,17 +81,32 @@ public class SmsSync extends PreferenceActivity implements OnPreferenceChangeLis
     public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         PreferenceManager prefMgr = getPreferenceManager();
-        
+
         addPreferencesFromResource(R.xml.main_screen);
 
-        PreferenceCategory cat = new PreferenceCategory(this);
-        cat.setOrder(0);
-        getPreferenceScreen().addPreference(cat);
         mStatusPref = new StatusPreference(this);
         mStatusPref.setSelectable(false);
-        cat.setTitle(R.string.ui_status_label);
-        cat.addPreference(mStatusPref);
+        
+        int sdkLevel = 1;
+        try {
+            sdkLevel = Integer.parseInt(Build.VERSION.SDK);
+        } catch (NumberFormatException nfe) {
+            // ignore (assume sdkLevel == 1)
+        }
 
+        if (sdkLevel < 3) {
+            // Older versions don't show the title bar for PreferenceActivity
+            PreferenceCategory cat = new PreferenceCategory(this);
+            cat.setOrder(0);
+            getPreferenceScreen().addPreference(cat);
+            cat.setTitle(R.string.ui_status_label);
+            cat.addPreference(mStatusPref);
+        } else {
+            // Newer SDK version show the title bar for PreferenceActivity
+            mStatusPref.setOrder(0);
+            getPreferenceScreen().addPreference(mStatusPref);
+        }
+        
         Preference pref = prefMgr.findPreference(PrefStore.PREF_LOGIN_USER);
         pref.setOnPreferenceChangeListener(this);
         
@@ -324,6 +340,12 @@ public class SmsSync extends PreferenceActivity implements OnPreferenceChangeLis
                                         SmsSyncService.getErrorDescription());
                                 status = STATUS_ERROR;
                                 break;
+                            case CANCELED:
+                                statusLabel = getString(R.string.status_canceled);
+                                statusDetails = getString(R.string.status_canceled_details,
+                                        SmsSyncService.getCurrentSyncedItems(),
+                                        SmsSyncService.getItemsToSyncCount());
+                                status = STATUS_IDLE;
                         } // switch (newStatus) { ... }
 
                         
@@ -379,7 +401,7 @@ public class SmsSync extends PreferenceActivity implements OnPreferenceChangeLis
                         mStatusLabel.setText(statusLabel);
                         mStatusLabel.setTextColor(getResources().getColor(color));
                         mSyncButton.setText(syncButtonText);
-                        mSyncButton.setEnabled(status != STATUS_WORKING);
+                        mSyncButton.setEnabled(true);
                         detailTextView.setText(statusDetails);
                         mStatusIcon.setImageResource(icon);
                         
@@ -391,7 +413,14 @@ public class SmsSync extends PreferenceActivity implements OnPreferenceChangeLis
         @Override
         public void onClick(View v) {
             if (v == mSyncButton) {
-                initiateSync();
+                if (!SmsSyncService.isWorking()) {
+                    initiateSync();
+                } else {
+                    SmsSyncService.cancel();
+                    // Sync button will be restored on next status update.
+                    mSyncButton.setText(R.string.ui_sync_button_label_canceling);
+                    mSyncButton.setEnabled(false);
+                }
             }
         }
 
@@ -447,8 +476,8 @@ public class SmsSync extends PreferenceActivity implements OnPreferenceChangeLis
                 builder = new AlertDialog.Builder(this);
                 builder.setTitle(R.string.ui_dialog_need_first_manual_sync_title);
                 builder.setMessage(R.string.ui_dialog_need_first_manual_sync_msg);
-                builder.setPositiveButton(R.string.ui_yes, dialogClickListener);
-                builder.setNegativeButton(R.string.ui_no, dialogClickListener);
+                builder.setPositiveButton(android.R.string.yes, dialogClickListener);
+                builder.setNegativeButton(android.R.string.no, dialogClickListener);
                 builder.setCancelable(false);
                 return builder.create();
             case DIALOG_FIRST_SYNC:
@@ -470,7 +499,7 @@ public class SmsSync extends PreferenceActivity implements OnPreferenceChangeLis
             case DIALOG_ABOUT:
                 builder = new AlertDialog.Builder(this);
                 builder.setCustomTitle(null);
-                builder.setPositiveButton(R.string.ui_ok, null);
+                builder.setPositiveButton(android.R.string.ok, null);
                 
                 DialogInterface.OnClickListener aboutEmailListener = new DialogInterface.OnClickListener() {
                     @Override
@@ -504,7 +533,7 @@ public class SmsSync extends PreferenceActivity implements OnPreferenceChangeLis
         Builder builder = new AlertDialog.Builder(this);
         builder.setTitle(title);
         builder.setMessage(msg);
-        builder.setPositiveButton(R.string.ui_ok, new DialogInterface.OnClickListener() {
+        builder.setPositiveButton(android.R.string.ok, new DialogInterface.OnClickListener() {
             @Override
             public void onClick(DialogInterface dialog, int which) {
                 dismissDialog(id);
